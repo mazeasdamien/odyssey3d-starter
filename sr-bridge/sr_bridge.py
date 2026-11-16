@@ -434,20 +434,33 @@ def make_handler(bridge: Bridge):
                     "X-Calib-Height": str(bridge.calib_h),
                 })
                 return
+            wanted = None
             if path.startswith("/lens/enable"):
-                bridge.set_lens(True)
-                print("[sr-bridge] 3D lens -> ENABLED", flush=True)
+                wanted = True
             elif path.startswith("/lens/disable"):
-                bridge.set_lens(False)
-                print("[sr-bridge] 3D lens -> DISABLED", flush=True)
+                wanted = False
             elif path.startswith("/lens/toggle"):
-                bridge.set_lens(not bridge.lens_requested)
+                wanted = not bridge.lens_requested
+            if wanted is not None:
+                changed = wanted != bridge.lens_requested
+                bridge.set_lens(wanted)
+                if changed:
+                    print(f"[sr-bridge] 3D lens -> {'ON' if wanted else 'OFF'}", flush=True)
             body = json.dumps(bridge.state(), separators=(",", ":")).encode("utf-8")
             self._send(200, body, "application/json; charset=utf-8", {"Cache-Control": "no-store"})
 
         do_POST = do_GET
 
     return Handler
+
+
+class QuietServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address) -> None:
+        if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
+            return  # the page went away while we were answering
+        super().handle_error(request, client_address)
 
 
 def lens_watchdog(bridge: Bridge) -> None:
@@ -484,11 +497,10 @@ def main() -> int:
         signal.signal(signal.SIGBREAK, lambda *_: sys.exit(0))
 
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(bridge))
+        server = QuietServer(("127.0.0.1", port), make_handler(bridge))
     except OSError as err:
         print(f"[sr-bridge] cannot listen on 127.0.0.1:{port}: {err} (another bridge running?)", flush=True)
         return 1
-    server.daemon_threads = True
     threading.Thread(target=lens_watchdog, args=(bridge,), daemon=True).start()
     print(f"[sr-bridge] Listening on http://127.0.0.1:{port} (2D desktop watchdog active)", flush=True)
     try:
