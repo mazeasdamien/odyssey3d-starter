@@ -15,6 +15,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -153,6 +154,8 @@ def main() -> int:
         if "--keep" not in sys.argv:
             for proc in reversed(started):
                 kill_tree(proc)
+            time.sleep(0.5)
+            shutil.rmtree(os.path.join(tempfile.gettempdir(), "odyssey3d-verify-profile"), ignore_errors=True)
 
 
 if __name__ == "__main__":

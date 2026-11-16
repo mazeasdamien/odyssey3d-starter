@@ -10,11 +10,9 @@ Write-Host "  SAMSUNG ODYSSEY 3D (G90XF) - 3D PAGE" -ForegroundColor Cyan
 Write-Host "==================================================================" -ForegroundColor Cyan
 
 # 1. Start the LeiaSR hardware bridge (sr-bridge/sr_bridge.py on port 5033, starts in 2D mode).
-#    The Python bridge is the reference one: it only loads the LeiaSR runtime's signed DLLs, whereas a
-#    rebuilt sr-bridge.exe is unsigned and Windows Smart App Control may refuse to run it.
+#    It only loads the LeiaSR runtime's signed DLLs, so Windows Smart App Control lets it run.
 $BridgeDir = Join-Path $ProjectRoot "sr-bridge"
 $BridgePy = Join-Path $BridgeDir "sr_bridge.py"
-$BridgeExe = Join-Path $BridgeDir "sr-bridge.exe"
 
 # Always start a fresh bridge: it reads the display geometry and the factory lens calibration once,
 # at start-up, so a bridge left over from before the monitor was plugged in would serve stale data.
@@ -40,17 +38,8 @@ if ($Python -and (Test-Path $BridgePy)) {
     Write-Host "[1/3] Starting the LeiaSR bridge (sr_bridge.py) on 127.0.0.1:5033 (2D desktop mode)..." -ForegroundColor Green
     Start-Process -FilePath $Python -ArgumentList ($PythonArgs + "`"$BridgePy`" --port 5033") -WorkingDirectory $BridgeDir -WindowStyle Minimized
     $BridgeStarted = $true
-} elseif (Test-Path $BridgeExe) {
-    Write-Host "[1/3] Python 3 not found: starting sr-bridge.exe instead (Windows may block it)..." -ForegroundColor Yellow
-    try {
-        Start-Process -FilePath $BridgeExe -ArgumentList "--port 5033" -WorkingDirectory $BridgeDir -WindowStyle Minimized -ErrorAction Stop
-        $BridgeStarted = $true
-    } catch {
-        Write-Host "      WARNING: sr-bridge.exe could not start: $($_.Exception.Message)" -ForegroundColor Yellow
-        Write-Host "      Install Python 3 (python.org) so the launcher can use sr-bridge\sr_bridge.py." -ForegroundColor Yellow
-    }
 } else {
-    Write-Host "[1/3] WARNING: no bridge found (sr-bridge\sr_bridge.py needs Python 3)." -ForegroundColor Yellow
+    Write-Host "[1/3] WARNING: Python 3 not found. Install it from python.org: the bridge is sr-bridge\sr_bridge.py." -ForegroundColor Yellow
 }
 
 if ($BridgeStarted) {
@@ -65,7 +54,7 @@ if ($BridgeStarted) {
         Write-Host "      WARNING: the LeiaSR runtime has not identified the monitor (no lens calibration)." -ForegroundColor Yellow
         Write-Host "      Check the monitor's USB upstream cable, then run this launcher again." -ForegroundColor Yellow
     } elseif (-not ($BridgeState.apiVersion -ge 2)) {
-        Write-Host "      WARNING: outdated bridge (its weave data is wrong). Use sr-bridge\sr_bridge.py." -ForegroundColor Yellow
+        Write-Host "      WARNING: outdated bridge on port 5033 (its weave data is wrong). Close it and run this again." -ForegroundColor Yellow
     } else {
         Write-Host ("      Display {0}x{1}, factory lens calibration loaded." -f $BridgeState.display.physResW, $BridgeState.display.physResH) -ForegroundColor Green
     }
