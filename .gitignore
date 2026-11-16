@@ -1,0 +1,5 @@
+node_modules/
+dist/
+tools/weave-check/
+__pycache__/
+*.log

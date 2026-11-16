@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Odyssey 3D — starter</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        width: 100vw;
+        height: 100vh;
+        overflow: hidden;
+        background: #07090d;
+        color: #eef2f7;
+        font: 600 16px/1.45 'Segoe UI', system-ui, sans-serif;
+      }
+      /* The canvas gets its exact CSS size from main.ts. Never stretch it with CSS: the browser
+         would resample it and the subpixel weave would be lost. */
+      canvas {
+        display: block;
+        image-rendering: pixelated;
+      }
+      /* Sized with the window (2560 CSS px wide on the G90XF) and opaque: through the 3D lens
+         each eye only gets half of the subpixels, so thin or translucent text breaks up. */
+      #status {
+        position: fixed;
+        left: 16px;
+        top: 16px;
+        padding: 12px 16px;
+        border-radius: 12px;
+        background: #0b0f16;
+        border: 1px solid rgba(255, 255, 255, 0.24);
+        font-size: clamp(14px, 0.85vw, 24px);
+        white-space: pre-line;
+        pointer-events: none;
+      }
+      #status.hidden {
+        display: none;
+      }
+      #status b.ok {
+        color: #34d17a;
+      }
+      #status b.warn {
+        color: #f5b83d;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="status"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
