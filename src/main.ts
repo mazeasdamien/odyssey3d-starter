@@ -5,7 +5,7 @@
  * work, and that are easy to break, are marked « 3D rule ».
  *
  * Keys: F full-screen 3D · 1 weave · 2 side-by-side · 3 anaglyph · 4 2D · T red/cyan test
- * pattern · [ ] phase · X swap eyes · H hide the status box.
+ * pattern · [ ] phase · , . head prediction −/+ 5 ms · X swap eyes · H hide the status box.
  */
 import {
   AmbientLight,
@@ -142,11 +142,23 @@ function windowOriginOnPanel(): { x: number; y: number } {
  * stops polling.
  */
 let lensWanted: boolean | null = null;
+let lensReassertedMs = 0;
 function syncLens(force = false): void {
   const want = mode === 'weave' && isFullscreen() && !document.hidden;
-  if (!force && want === lensWanted && sr.current.lensEnabled === want) return;
-  lensWanted = want;
-  void sr.setLensEnabled(want);
+  if (force || want !== lensWanted) {
+    // Our own wish changed: say so once. A page that is windowed or in the background releases
+    // the lens here and then leaves it alone, so it never fights the page that is showing 3D.
+    lensWanted = want;
+    lensReassertedMs = performance.now();
+    void sr.setLensEnabled(want);
+    return;
+  }
+  // We are the visible full-screen 3D page and something else dropped the lens: take it back,
+  // at most once a second.
+  if (want && sr.current.connected && !sr.current.lensEnabled && performance.now() - lensReassertedMs > 1000) {
+    lensReassertedMs = performance.now();
+    void sr.setLensEnabled(true);
+  }
 }
 
 document.addEventListener('fullscreenchange', () => syncLens(true));
@@ -172,6 +184,9 @@ window.addEventListener('keydown', (e) => {
   else if (key === ']') weave.phaseOffset += e.shiftKey ? 0.05 : 0.01;
   else if (key === 'x') kooima.swapEyes = !kooima.swapEyes;
   else if (key === 'h') statusEl.classList.toggle('hidden');
+  // Head prediction: raise it if the depth lags behind when you move, lower it if it overshoots.
+  else if (key === ',') sr.setPredictionLeadMs(sr.predictionLeadMs - 5);
+  else if (key === '.') sr.setPredictionLeadMs(sr.predictionLeadMs + 5);
   else return;
   syncLens();
 });
@@ -186,6 +201,7 @@ function refreshStatus(): void {
     `Calibration: ${flag(s.displayTrusted, 'factory data loaded', `missing${problems ? ` (${problems})` : ''}`)}`,
     `Eyes: ${flag(s.tracking, `tracked at ${(s.weaverPosMm[2] / 10).toFixed(0)} cm`, 'not tracked')}`,
     `Lens: ${flag(s.lensEnabled, '3D', '2D')} · mode ${mode}${weave.testPattern ? ' · test pattern' : ''}`,
+    `Head prediction: ${sr.predictionLeadMs} ms (keys , and .)`,
     isFullscreen() ? 'F: leave full-screen' : 'F: full-screen 3D (depth is only exact in full-screen)',
     ...(s.hubConversion
       ? [

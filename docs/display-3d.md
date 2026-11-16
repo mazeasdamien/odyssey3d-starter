@@ -31,6 +31,8 @@ src/odyssey3d/sr-client.ts    validated state, smoothed eyes
 | Route | Answer |
 |---|---|
 | `GET /state` | JSON: `apiVersion` (2), `connected`, `lensEnabled`, `tracking`, `leftEyeMm`, `rightEyeMm`, `weaverPosMm` (mm; origin at the screen centre, x to the viewer's right, y up, z towards the viewer), `display`, `optics`, `weaveCorners` |
+| `GET /state?lead=35` | same, with `weaveCorners` computed for where the head will be in 35 ms (the runtime's own predictor) |
+| `GET /stream?lead=35` | the state pushed 120 times a second as server-sent events; this is what the page uses |
 | `POST /lens/enable` · `/lens/disable` | switches the lens, answers with the state |
 | `GET /calibration` | 2 × 480×270 bytes: the two factory correction maps (A then B), first row = bottom of the panel |
 
@@ -82,7 +84,8 @@ for each subpixel c in {R, G, B}:
 | `--probe` reports 7680×4320, 69.8 cm, no calibration; log says "Can not retrieve product code" | USB upstream cable not connected | Connect it, restart the bridge |
 | Double image, no depth, hardware recognised | Wrong phase formula, or eyes passed in mm | Use `stereo-composer.ts` and `sr_bridge.py` as they are |
 | No depth although every check on the page passes; `verify_page.py` says COVERED | Odyssey 3D Hub's "Convert to 3D in full screen" draws over the page | Turn that setting off in Odyssey 3D Hub (rule 8) |
-| Fine when still, wrong when moving | Too much smoothing or latency on the eye position | Poll `/state` at 60 Hz, smoothing ≤ 20 ms |
+| Depth stutters or lags when the head moves | Eye data too slow or too late. Seen here: the lens-state query took 31 ms inside every `/state` answer (30 updates a second, 31 ms late), and no prediction | Use `/stream` (120 Hz), keep slow runtime calls out of the state path, tune the prediction lead (keys `,` `.`) |
+| Lens flickers on and off several times a second | Two pages talk to the bridge and one keeps forcing the lens off | A page only says what it wants when that changes; close stray tabs of the page |
 | Moiré, bands | Canvas resampled (CSS size ≠ buffer, browser zoom) | Rule 1 |
 | Striped Windows desktop | Lens left on | `POST /lens/disable`; rule 5 |
 | The official weaver outputs the left view only | Its window is hidden or covered, the lens is off, or nobody is tracked | Visible window on top, lens on, someone in front |
@@ -91,8 +94,9 @@ for each subpixel c in {R, G, B}:
 
 ## Limits
 
-- The bridge sends the **current** eye position; the official weaver **predicts** it. Depth can
-  break up briefly during fast head movement.
+- The weave is computed for a **predicted** head position (35 ms ahead by default, the runtime's
+  own predictor). The right lead depends on the PC and the refresh rate; it has only been tuned
+  by eye on one machine.
 - Without factory calibration the shader falls back to a generic approximation that does not give
   a clean 3D image. It is not a usable fallback.
 - Chrome or Edge (WebGL2), page zoom 100 %. Windows only.

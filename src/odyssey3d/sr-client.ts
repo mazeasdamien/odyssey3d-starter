@@ -148,11 +148,21 @@ export function actualScreenPixels(): { w: number; h: number } {
   };
 }
 
+const clampLead = (ms: number): number => (Number.isFinite(ms) ? Math.min(80, Math.max(0, Math.round(ms))) : 0);
+
 const finitePositive = (v: unknown): v is number =>
   typeof v === 'number' && Number.isFinite(v) && v > 0;
 
+/**
+ * How far ahead the bridge predicts the head, in milliseconds: the time between the eye tracker's
+ * measurement and the picture reaching the panel (transport, one rendered frame, scan-out).
+ * 0 = no prediction. Too low and the depth lags behind a moving head; too high and it overshoots.
+ */
+export const DEFAULT_PREDICTION_LEAD_MS = 35;
+
 export interface SrBridgeClientOptions {
   baseUrl?: string;
+  predictionLeadMs?: number;
   onStateChange?: (state: SrBridgeState) => void;
   onCalibrationLoaded?: (tex0: Uint8Array, tex1: Uint8Array, width: number, height: number) => void;
 }
@@ -174,11 +184,16 @@ export class SrBridgeClient {
   private smoothedWeaverMm: [number, number, number] = [0.0, 100.0, 600.0];
 
   private pollTimer: number | null = null;
+  private stream: EventSource | null = null;
+  private lastStreamMs = -1e9;
+  private leadMs: number;
   private inFlight = false;
   private calibLoaded = false;
   private calibInFlight = false;
   private disposed = false;
   private lastLensHeartbeatMs = 0;
+  /** What THIS page last asked for. Another page may hold the lens too: never act on its wish. */
+  private wantLens = false;
   private lastSmoothMs = performance.now();
   private calibRetryAtMs = 0;
 
@@ -188,6 +203,7 @@ export class SrBridgeClient {
 
   constructor(options: SrBridgeClientOptions = {}) {
     this.baseUrl = (options.baseUrl ?? '/sr-bridge').replace(/\/+$/, '');
+    this.leadMs = clampLead(options.predictionLeadMs ?? DEFAULT_PREDICTION_LEAD_MS);
     this.onStateChange = options.onStateChange;
     this.onCalibrationLoaded = options.onCalibrationLoaded;
 
@@ -199,15 +215,71 @@ export class SrBridgeClient {
   start(): void {
     if (this.pollTimer !== null) return;
     void this.pollOnce();
+    this.openStream();
+    // The stream carries the state; this timer is the fallback (old bridge, proxy without
+    // streaming) and runs the housekeeping (calibration fetch, lens heartbeat).
     this.pollTimer = window.setInterval(() => {
       void this.pollOnce();
-    }, 16); // ~60 Hz bridge poll (localhost), smoothed per render frame
+    }, 16);
   }
 
   stop(): void {
     if (this.pollTimer !== null) {
       window.clearInterval(this.pollTimer);
       this.pollTimer = null;
+    }
+    this.stream?.close();
+    this.stream = null;
+  }
+
+  get predictionLeadMs(): number {
+    return this.leadMs;
+  }
+
+  /** Changes how far ahead the bridge predicts the head (see DEFAULT_PREDICTION_LEAD_MS). */
+  setPredictionLeadMs(ms: number): void {
+    const next = clampLead(ms);
+    if (next === this.leadMs) return;
+    this.leadMs = next;
+    if (this.stream) this.openStream();
+  }
+
+  /**
+   * Server-sent events from the bridge: the state arrives 120 times a second without a request
+   * per sample, which removes the polling delay and its jitter.
+   */
+  private openStream(): void {
+    this.stream?.close();
+    this.stream = null;
+    if (this.disposed || typeof EventSource === 'undefined') return;
+    const stream = new EventSource(`${this.baseUrl}/stream?lead=${this.leadMs}`);
+    stream.onmessage = (ev: MessageEvent<string>) => {
+      try {
+        const data = JSON.parse(ev.data) as Partial<SrBridgeState>;
+        this.lastStreamMs = performance.now();
+        this.applyPayload(data, true);
+      } catch {
+        // a malformed sample is skipped; the next one is 8 ms away
+      }
+    };
+    this.stream = stream; // EventSource reconnects by itself; polling covers the gap
+  }
+
+  private get streaming(): boolean {
+    return performance.now() - this.lastStreamMs < 250;
+  }
+
+  private afterState(): void {
+    // The LUTs only exist when the runtime identified the panel; ask at most every 10 s.
+    if (!this.calibLoaded && this.state.displayTrusted && performance.now() >= this.calibRetryAtMs) {
+      this.calibRetryAtMs = performance.now() + 10_000;
+      void this.fetchCalibrationOnce();
+    }
+    // Watchdog heartbeat: while the lens is requested, re-assert it every 1.5 s so the bridge's
+    // watchdog never drops it under a live viewer.
+    if (this.wantLens && performance.now() - this.lastLensHeartbeatMs > 1500) {
+      this.lastLensHeartbeatMs = performance.now();
+      void fetch(`${this.baseUrl}/lens/enable`, { method: 'POST', cache: 'no-store' }).catch(() => {});
     }
   }
 
@@ -275,6 +347,7 @@ export class SrBridgeClient {
 
   /** Enables or disables the physical Switchable Lenticular Lens on the Samsung Odyssey G90XF. */
   async setLensEnabled(enable: boolean): Promise<boolean> {
+    this.wantLens = enable;
     if (enable) {
       this.lastLensHeartbeatMs = performance.now();
     }
@@ -335,24 +408,29 @@ export class SrBridgeClient {
 
   private async pollOnce(): Promise<void> {
     if (this.inFlight || this.disposed) return;
+    if (this.streaming) {
+      this.afterState();
+      return;
+    }
     this.inFlight = true;
     try {
       const controller = new AbortController();
       const timeout = window.setTimeout(() => controller.abort(), 450);
       try {
-        let resp = await fetch(`${this.baseUrl}/state`, {
+        let resp = await fetch(`${this.baseUrl}/state?lead=${this.leadMs}`, {
           method: 'GET',
           cache: 'no-store',
           signal: controller.signal,
         }).catch(() => null);
         if ((!resp || !resp.ok) && this.baseUrl !== this.fallbackUrl) {
-          resp = await fetch(`${this.fallbackUrl}/state`, {
+          resp = await fetch(`${this.fallbackUrl}/state?lead=${this.leadMs}`, {
             method: 'GET',
             cache: 'no-store',
             signal: controller.signal,
           }).catch(() => null);
           if (resp && resp.ok) {
             this.baseUrl = this.fallbackUrl;
+            this.openStream();
           }
         }
         if (resp && resp.ok) {
@@ -362,17 +440,7 @@ export class SrBridgeClient {
             return;
           }
           this.applyPayload(data, true);
-          // The LUTs only exist when the runtime identified the panel; ask at most every 10 s.
-          if (!this.calibLoaded && this.state.displayTrusted && performance.now() >= this.calibRetryAtMs) {
-            this.calibRetryAtMs = performance.now() + 10_000;
-            void this.fetchCalibrationOnce();
-          }
-          // Watchdog heartbeat: when lens is requested, continuously assert /lens/enable every 1.5s
-          // so the hardware watchdog in sr-bridge never drops the physical 3D lenticular lens!
-          if (this.state.lensRequested && performance.now() - this.lastLensHeartbeatMs > 1500) {
-            this.lastLensHeartbeatMs = performance.now();
-            void fetch(`${this.baseUrl}/lens/enable`, { method: 'POST', cache: 'no-store' }).catch(() => {});
-          }
+          this.afterState();
         } else {
           this.markUnreachable();
         }

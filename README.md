@@ -32,6 +32,7 @@ Needs Windows, the LeiaSR runtime (ships with the monitor), Python 3, Node.js, C
 | `F` | Full-screen 3D (the lens is only on in full-screen) |
 | `1` `2` `3` `4` | Weave · side by side · anaglyph · 2D |
 | `T` | Test pattern: left eye sees red, right eye sees cyan |
+| `,` `.` | Head prediction −/+ 5 ms: raise it if depth lags when you move, lower it if it overshoots |
 | `[` `]` | Phase −/+ · `X` swap eyes · `H` hide the status box |
 
 ## Make it yours

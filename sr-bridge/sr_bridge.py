@@ -3,7 +3,9 @@
 Local HTTP API on http://127.0.0.1:5033:
 
     GET  /state          eye positions (mm), display geometry, lens optics, and the per-corner
-                         Dimenco weave attributes for the current eye position
+                         Dimenco weave attributes for the eye position; ?lead=35 computes them
+                         for where the head will be in 35 ms (the runtime's own predictor)
+    GET  /stream         the same state pushed 120 times a second (server-sent events)
     POST /lens/enable    switch the 3D lens on   (answers with the state)
     POST /lens/disable   switch the 3D lens off  (answers with the state)
     GET  /calibration    the two factory 480x270 correction maps, one byte per texel
@@ -32,6 +34,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BIN = r"C:\Program Files\LeiaSR\Platform\bin"
 API_VERSION = 2  # 2: weave attributes computed with the eye position in centimetres
+STREAM_HZ = 120
+MAX_LEAD_MS = 80.0
 LENS_WATCHDOG_S = 3.5
 TRACKING_TIMEOUT_S = 0.35
 # Samsung's Odyssey 3D Hub starts this player to convert a full-screen window to 3D by itself
@@ -45,6 +49,10 @@ class Point3d(C.Structure):
 
 class EyePair(C.Structure):
     _fields_ = [("frameId", C.c_uint64), ("timeUs", C.c_uint64), ("left", Point3d), ("right", Point3d)]
+
+
+class WeaverPosition(C.Structure):
+    _fields_ = [("frameId", C.c_uint64), ("timeUs", C.c_uint64), ("pos", Point3d)]
 
 
 class FLOAT2(C.Structure):
@@ -133,6 +141,9 @@ class Bridge:
         self.ipd = 63.0
 
         self._lens = None
+        self._lens_state = False
+        self._predictor = None
+        self._predict = None
         self._keep = []  # ctypes objects that must outlive the SR runtime's use of them
 
     # ---- LeiaSR runtime -------------------------------------------------------------------
@@ -203,6 +214,15 @@ class Bridge:
             callback = EYE_CALLBACK(self._on_eye_pair)
             self._keep.append(callback)
             fn(trackers, "createEyePairListener", C.c_void_p, C.c_void_p, EYE_CALLBACK)(tracker, callback)
+        # The runtime's own motion predictor, the one the official weaver uses: it answers "where
+        # will the weaving position be in N microseconds", in centimetres.
+        try:
+            self._predictor = fn(trackers, "?create@PredictingWeaverTracker@SR@@SAPEAV12@AEAVSRContext@2@@Z",
+                                 C.c_void_p, C.c_void_p)(ctx)
+            self._predict = fn(trackers, "?predict@PredictingWeaverTracker@SR@@QEAAX_KAEAUSR_weaverPosition@@@Z",
+                               None, C.c_void_p, C.c_uint64, C.POINTER(WeaverPosition))
+        except (AttributeError, OSError):
+            self._predictor = None
         init_ctx(ctx)
         time.sleep(0.12)
 
@@ -317,10 +337,17 @@ class Bridge:
 
     # ---- lens -----------------------------------------------------------------------------
 
-    def lens_enabled(self) -> bool:
+    def _query_lens(self) -> bool:
+        """Asks the runtime. Slow (about 30 ms): never call it while answering /state."""
         if not self._lens:
             return False
-        return bool(self._lens_is_on(self._lens)) or bool(self._lens_is_on_pref(self._lens))
+        state = bool(self._lens_is_on(self._lens)) or bool(self._lens_is_on_pref(self._lens))
+        self._lens_state = state
+        return state
+
+    def lens_enabled(self) -> bool:
+        """Last known lens state, refreshed in the background by `lens_poller` and by `set_lens`."""
+        return self._lens_state
 
     def set_lens(self, enable: bool) -> None:
         self.lens_requested = enable
@@ -330,13 +357,29 @@ class Bridge:
             return
         (self._lens_on if enable else self._lens_off)(self._lens)
         for _ in range(8):
-            if self.lens_enabled() == enable:
+            if self._query_lens() == enable:
                 break
             time.sleep(0.02)
 
     # ---- state ----------------------------------------------------------------------------
 
-    def weave_corners(self, eye_mm) -> dict:
+    def predicted_weaver_cm(self, raw_mm, lead_ms: float):
+        """Where the weaving position will be in `lead_ms`, in cm; None when there is no usable answer."""
+        if not self._predictor or lead_ms <= 0:
+            return None
+        out = WeaverPosition()
+        with self.weave_lock:
+            self._predict(self._predictor, int(lead_ms * 1000), C.byref(out))
+        p = (out.pos.x, out.pos.y, out.pos.z)
+        if not all(math.isfinite(v) for v in p):
+            return None
+        # A prediction is a small step from where the eyes are now. Anything further is the
+        # predictor's idle default or a glitch: keep the measured position instead.
+        if math.dist(p, (raw_mm[0] * 0.1, raw_mm[1] * 0.1, raw_mm[2] * 0.1)) > 6.0:
+            return None
+        return p
+
+    def weave_corners(self, eye_cm) -> dict:
         corners = {"valid": False, "calibW": self.calib_w, "calibH": self.calib_h}
         zero = [0.0, 0.0, 0.0, 0.0, 0.0]
         values = {"tl": zero, "tr": zero, "bl": zero, "br": zero}
@@ -346,7 +389,7 @@ class Bridge:
             with self.weave_lock:
                 # Dimenco::Weaver::SetGlobalParameters takes the eye position in CENTIMETRES; the
                 # eye tracker reports millimetres. (Checked with tools/verify_weave.py.)
-                self._set_eye(FLOAT3(eye_mm[0] * 0.1, eye_mm[1] * 0.1, eye_mm[2] * 0.1))
+                self._set_eye(FLOAT3(eye_cm[0], eye_cm[1], eye_cm[2]))
                 for name, (nx, ny) in (("tl", (-1, 1)), ("tr", (1, 1)), ("bl", (-1, -1)), ("br", (1, -1))):
                     a2, a3, a4, a5 = FLOAT4(), FLOAT4(), FLOAT2(), FLOAT2()
                     self._fill(C.byref(size), C.byref(offset), C.byref(FLOAT4(nx, ny, 0.0, 1.0)),
@@ -366,11 +409,15 @@ class Bridge:
                 self._hub_conversion = False
         return self._hub_conversion
 
-    def state(self) -> dict:
+    def state(self, lead_ms: float = 0.0) -> dict:
         with self.eye_lock:
             left, right, weaver = list(self.left), list(self.right), list(self.weaver_pos)
             frame_id, time_us, ipd, last_tracked = self.frame_id, self.time_us, self.ipd, self.last_tracked
         tracking = last_tracked > 0.0 and (time.monotonic() - last_tracked) < TRACKING_TIMEOUT_S
+        weave_cm = [weaver[0] * 0.1, weaver[1] * 0.1, weaver[2] * 0.1]
+        predicted = self.predicted_weaver_cm(weaver, lead_ms) if tracking else None
+        if predicted:
+            weave_cm = list(predicted)
         return {
             "apiVersion": API_VERSION,
             "connected": self.connected,
@@ -384,9 +431,11 @@ class Bridge:
             "leftEyeMm": [round(v, 3) for v in left],
             "rightEyeMm": [round(v, 3) for v in right],
             "weaverPosMm": [round(v, 3) for v in weaver],
+            "leadMs": round(lead_ms, 1) if predicted else 0.0,
+            "weavePosMm": [round(v * 10.0, 3) for v in weave_cm],
             "display": self.display,
             "optics": self.optics,
-            "weaveCorners": self.weave_corners(weaver),
+            "weaveCorners": self.weave_corners(weave_cm),
         }
 
 
@@ -421,9 +470,41 @@ def make_handler(bridge: Bridge):
                 "Access-Control-Allow-Headers": "Content-Type, Access-Control-Request-Private-Network",
             })
 
+        def _lead_ms(self) -> float:
+            query = self.path.split("?", 1)[1] if "?" in self.path else ""
+            for part in query.split("&"):
+                if part.startswith("lead="):
+                    try:
+                        return min(MAX_LEAD_MS, max(0.0, float(part[5:])))
+                    except ValueError:
+                        return 0.0
+            return 0.0
+
+        def _stream(self, lead_ms: float) -> None:
+            self.send_response(200)
+            for key, value in CORS.items():
+                self.send_header(key, value)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            period = 1.0 / STREAM_HZ
+            while True:  # ends with a ConnectionError when the page goes away
+                started = time.monotonic()
+                bridge.last_heartbeat = started
+                body = json.dumps(bridge.state(lead_ms), separators=(",", ":")).encode("utf-8")
+                self.wfile.write(b"data: " + body + b"\n\n")
+                self.wfile.flush()
+                time.sleep(max(0.0, period - (time.monotonic() - started)))
+
         def do_GET(self) -> None:
             bridge.last_heartbeat = time.monotonic()
             path = self.path.split("?", 1)[0]
+            if path.startswith("/stream"):
+                self._stream(self._lead_ms())
+                return
             if path.startswith("/calibration"):
                 if not bridge.calibrated:
                     self._send(404, b"", "application/octet-stream")
@@ -446,7 +527,7 @@ def make_handler(bridge: Bridge):
                 bridge.set_lens(wanted)
                 if changed:
                     print(f"[sr-bridge] 3D lens -> {'ON' if wanted else 'OFF'}", flush=True)
-            body = json.dumps(bridge.state(), separators=(",", ":")).encode("utf-8")
+            body = json.dumps(bridge.state(self._lead_ms()), separators=(",", ":")).encode("utf-8")
             self._send(200, body, "application/json; charset=utf-8", {"Cache-Control": "no-store"})
 
         do_POST = do_GET
@@ -461,6 +542,16 @@ class QuietServer(ThreadingHTTPServer):
         if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
             return  # the page went away while we were answering
         super().handle_error(request, client_address)
+
+
+def lens_poller(bridge: Bridge) -> None:
+    """Keeps the lens state fresh without making every /state answer wait for the runtime."""
+    while True:
+        time.sleep(0.3)
+        try:
+            bridge._query_lens()
+        except OSError:
+            pass
 
 
 def lens_watchdog(bridge: Bridge) -> None:
@@ -502,6 +593,7 @@ def main() -> int:
         print(f"[sr-bridge] cannot listen on 127.0.0.1:{port}: {err} (another bridge running?)", flush=True)
         return 1
     threading.Thread(target=lens_watchdog, args=(bridge,), daemon=True).start()
+    threading.Thread(target=lens_poller, args=(bridge,), daemon=True).start()
     print(f"[sr-bridge] Listening on http://127.0.0.1:{port} (2D desktop watchdog active)", flush=True)
     try:
         server.serve_forever(poll_interval=0.2)
