@@ -3,8 +3,8 @@
 Local HTTP API on http://127.0.0.1:5033:
 
     GET  /state          eye positions (mm), display geometry, lens optics, and the per-corner
-                         Dimenco weave attributes for the eye position; ?lead=35 computes them
-                         for where the head will be in 35 ms (the runtime's own predictor)
+                         Dimenco weave attributes for the eye position; ?lead=50 computes them
+                         for where the head will be in 50 ms (the bridge's own predictor, filtered)
     GET  /stream         the same state pushed 120 times a second (server-sent events)
     POST /lens/enable    switch the 3D lens on   (answers with the state)
     POST /lens/disable   switch the 3D lens off  (answers with the state)
@@ -111,11 +111,99 @@ def process_running(exe_name: str) -> bool:
         kernel32.CloseHandle(snapshot)
 
 
+class OneEuro:
+    """One Euro filter (Casiez et al., CHI 2012) on a 3D point: strong smoothing while the head is
+    still (the tracker's millimetre jitter, amplified by the prediction, made the 3D tremble), light
+    smoothing while it moves (no lag added to a real move). Positions in mm, time in seconds."""
+
+    def __init__(self, min_cutoff_hz: float, beta: float, d_cutoff_hz: float = 1.0) -> None:
+        self.min_cutoff = min_cutoff_hz
+        self.beta = beta
+        self.d_cutoff = d_cutoff_hz
+        self.t = None
+        self.x = [0.0, 0.0, 0.0]
+        self.dx = [0.0, 0.0, 0.0]
+
+    @staticmethod
+    def _alpha(dt: float, cutoff_hz: float) -> float:
+        tau = 1.0 / (2.0 * math.pi * cutoff_hz)
+        return 1.0 / (1.0 + tau / dt)
+
+    def reset(self) -> None:
+        self.t = None
+
+    def __call__(self, t: float, x) -> list:
+        if self.t is None or t - self.t > 0.3:  # first sample, or after a gap: start from here
+            self.t, self.x, self.dx = t, list(x), [0.0, 0.0, 0.0]
+            return list(self.x)
+        dt = t - self.t
+        if dt <= 0:
+            return list(self.x)
+        self.t = t
+        a_d = self._alpha(dt, self.d_cutoff)
+        for i in range(3):
+            self.dx[i] += a_d * ((x[i] - self.x[i]) / dt - self.dx[i])
+        speed = math.sqrt(sum(d * d for d in self.dx))
+        a = self._alpha(dt, self.min_cutoff + self.beta * speed)
+        for i in range(3):
+            self.x[i] += a * (x[i] - self.x[i])
+        return list(self.x)
+
+
+# The weave position's filter: 1 Hz when still, + 0.03 Hz per mm/s of head speed (16 Hz at 0.5 m/s).
+WEAVE_FILTER_MIN_CUTOFF_HZ = 1.0
+WEAVE_FILTER_BETA = 0.03
+
+
+class HeadPredictor:
+    """Where the mid-eye will be `lead` from now: the last tracked position plus a smoothed velocity
+    times (the sample's age + lead). Replaces the runtime's PredictingWeaverTracker, which on this
+    machine lagged and drifted from the tracked head by up to 2 cm (recorded: still stuck at
+    x -61 mm while the head went from -55 to -39 mm); the bridge then fell back to the
+    measured head whenever it strayed over 6 cm, and the 3D jumped back and forth between the two.
+    The tracker reports at 60 Hz (half the callbacks repeat the last timestamp); extrapolating by
+    the sample's age also turns its 60 Hz steps into a smooth motion at the page's 120 Hz."""
+
+    VELOCITY_CUTOFF_HZ = 5.0
+    MAX_SPEED_MM_S = 1500.0
+    MAX_AHEAD_S = 0.15
+
+    def __init__(self) -> None:
+        self.t = None  # tracker clock of the last sample, s
+        self.arrival = 0.0  # time.monotonic() when it arrived
+        self.x = [0.0, 0.0, 0.0]
+        self.v = [0.0, 0.0, 0.0]
+
+    def add(self, t: float, x, arrival: float) -> None:
+        if self.t is None or t < self.t or t - self.t > 0.2:  # first sample, clock reset or a gap
+            self.t, self.arrival, self.x, self.v = t, arrival, list(x), [0.0, 0.0, 0.0]
+            return
+        dt = t - self.t
+        if dt < 0.002:  # the same tracker sample delivered again
+            return
+        a = 1.0 / (1.0 + 1.0 / (2.0 * math.pi * self.VELOCITY_CUTOFF_HZ * dt))
+        for i in range(3):
+            self.v[i] += a * ((x[i] - self.x[i]) / dt - self.v[i])
+        self.t, self.arrival, self.x = t, arrival, list(x)
+
+    def predict(self, now: float, lead_s: float):
+        if self.t is None:
+            return None
+        speed = math.sqrt(sum(c * c for c in self.v))
+        k = 1.0 if speed <= self.MAX_SPEED_MM_S else self.MAX_SPEED_MM_S / speed
+        ahead = min(self.MAX_AHEAD_S, lead_s + max(0.0, now - self.arrival))
+        return [self.x[i] + self.v[i] * k * ahead for i in range(3)]
+
+
 class Bridge:
     def __init__(self) -> None:
         self.connected = False
         self._hub_conversion = False
         self._hub_conversion_checked = 0.0
+        # One filter per prediction lead asked for (a page and a test may ask for different leads).
+        self._weave_filters: dict = {}
+        self._weave_filter_lock = threading.Lock()
+        self._head = HeadPredictor()  # fed under eye_lock
         self.calibrated = False
         self.lens_requested = False
         self.last_heartbeat = 0.0
@@ -328,6 +416,7 @@ class Bridge:
                 self.right = [rx, ry, rz]
                 self.weaver_pos = [0.5 * (lx + rx), 0.5 * (ly + ry), 0.5 * (lz + rz)]
                 self.ipd = ipd
+                self._head.add(pair.timeUs * 1e-6, self.weaver_pos, now)
             elif lz > 150.0 and ipd < 5.0 and (self.last_tracked == 0.0 or now - self.last_tracked > 0.4):
                 # Nobody tracked: the runtime reports its default viewing position for both eyes.
                 self.weaver_pos = [lx, ly, lz]
@@ -413,11 +502,25 @@ class Bridge:
         with self.eye_lock:
             left, right, weaver = list(self.left), list(self.right), list(self.weaver_pos)
             frame_id, time_us, ipd, last_tracked = self.frame_id, self.time_us, self.ipd, self.last_tracked
-        tracking = last_tracked > 0.0 and (time.monotonic() - last_tracked) < TRACKING_TIMEOUT_S
+            now = time.monotonic()
+            ahead_mm = self._head.predict(now, lead_ms * 0.001) if lead_ms > 0 else None
+        tracking = last_tracked > 0.0 and (now - last_tracked) < TRACKING_TIMEOUT_S
         weave_cm = [weaver[0] * 0.1, weaver[1] * 0.1, weaver[2] * 0.1]
-        predicted = self.predicted_weaver_cm(weaver, lead_ms) if tracking else None
+        predicted = [v * 0.1 for v in ahead_mm] if tracking and ahead_mm else None
         if predicted:
-            weave_cm = list(predicted)
+            weave_cm = predicted
+        # The predicted position extrapolates the tracker's jitter: filter it before the weave and
+        # the page's views use it, or the 3D trembles.
+        unfiltered_cm = list(weave_cm)
+        key = round(lead_ms) if predicted else -1
+        with self._weave_filter_lock:
+            f = self._weave_filters.get(key)
+            if f is None:
+                f = self._weave_filters[key] = OneEuro(WEAVE_FILTER_MIN_CUTOFF_HZ, WEAVE_FILTER_BETA)
+            if tracking:
+                weave_cm = [v * 0.1 for v in f(time.monotonic(), [v * 10.0 for v in weave_cm])]
+            else:
+                f.reset()
         return {
             "apiVersion": API_VERSION,
             "connected": self.connected,
@@ -433,6 +536,8 @@ class Bridge:
             "weaverPosMm": [round(v, 3) for v in weaver],
             "leadMs": round(lead_ms, 1) if predicted else 0.0,
             "weavePosMm": [round(v * 10.0, 3) for v in weave_cm],
+            # Diagnostic: the prediction before the jitter filter (mm).
+            "weavePosRawMm": [round(v * 10.0, 3) for v in unfiltered_cm],
             "display": self.display,
             "optics": self.optics,
             "weaveCorners": self.weave_corners(weave_cm),

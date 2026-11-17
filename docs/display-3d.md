@@ -31,8 +31,8 @@ src/odyssey3d/sr-client.ts    validated state, smoothed eyes
 | Route | Answer |
 |---|---|
 | `GET /state` | JSON: `apiVersion` (2), `connected`, `lensEnabled`, `tracking`, `leftEyeMm`, `rightEyeMm`, `weaverPosMm` (mm; origin at the screen centre, x to the viewer's right, y up, z towards the viewer), `display`, `optics`, `weaveCorners` |
-| `GET /state?lead=35` | same, with `weaveCorners` computed for where the head will be in 35 ms (the runtime's own predictor) |
-| `GET /stream?lead=35` | the state pushed 120 times a second as server-sent events; this is what the page uses |
+| `GET /state?lead=50` | same, with `weaveCorners` and `weavePosMm` computed for where the head will be in 50 ms (the bridge's own predictor: tracked position + smoothed velocity × (sample age + lead), then a One Euro filter against jitter); `weavePosRawMm` is the prediction before the filter |
+| `GET /stream?lead=50` | the state pushed 120 times a second as server-sent events; this is what the page uses |
 | `POST /lens/enable` · `/lens/disable` | switches the lens, answers with the state |
 | `GET /calibration` | 2 × 480×270 bytes: the two factory correction maps (A then B), first row = bottom of the panel |
 
@@ -85,6 +85,11 @@ for each subpixel c in {R, G, B}:
 | Double image, no depth, hardware recognised | Wrong phase formula, or eyes passed in mm | Use `stereo-composer.ts` and `sr_bridge.py` as they are |
 | No depth although every check on the page passes; `verify_page.py` says COVERED | Odyssey 3D Hub's "Convert to 3D in full screen" draws over the page | Turn that setting off in Odyssey 3D Hub (rule 8) |
 | Depth stutters or lags when the head moves | Eye data too slow or too late. Seen here: the lens-state query took 31 ms inside every `/state` answer (30 updates a second, 31 ms late), and no prediction | Use `/stream` (120 Hz), keep slow runtime calls out of the state path, tune the prediction lead (keys `,` `.`) |
+| The scene turns or floats with the head | The virtual eyes were not the physical eyes times one factor (different scales per axis, or a reduced eye separation) | `kooima-camera.ts` as it is: one factor on all three axes, stereo strength 1 |
+| Image doubles on fast head moves | Views rendered for the measured head while the weave is for the predicted one, or the lead too short | The page moves both eyes by the bridge's prediction (`weavePosMm − weaverPosMm`); lead 50 ms |
+| The 3D trembles with the head still | The prediction extrapolates the tracker's millimetre jitter | The bridge filters the predicted position (One Euro: 1 Hz still, opening with speed) before the weave and the views use it |
+| The 3D jumps back and forth by a centimetre or two while the head moves | The runtime's `PredictingWeaverTracker` lags and drifts from the tracked head; whenever it strayed too far the bridge fell back to the measured head | The bridge predicts by itself from the tracked head (`HeadPredictor`) |
+| Head motion still not smooth although the bridge's output is | Windows drives the panel at 60 Hz: the image steps about 5 mm per frame at a normal head speed | Set the G90XF to its highest refresh rate in Windows (Settings → System → Display → Advanced display), then retune the lead (keys `,` `.`) |
 | Lens flickers on and off several times a second | Two pages talk to the bridge and one keeps forcing the lens off | A page only says what it wants when that changes; close stray tabs of the page |
 | Moiré, bands | Canvas resampled (CSS size ≠ buffer, browser zoom) | Rule 1 |
 | Striped Windows desktop | Lens left on | `POST /lens/disable`; rule 5 |
@@ -94,9 +99,10 @@ for each subpixel c in {R, G, B}:
 
 ## Limits
 
-- The weave is computed for a **predicted** head position (35 ms ahead by default, the runtime's
-  own predictor). The right lead depends on the PC and the refresh rate; it has only been tuned
-  by eye on one machine.
+- The weave and the two views are computed for a **predicted** head position (50 ms ahead by
+  default, tuned at 60 Hz: one frame of the runtime plus about two frames for a browser page),
+  filtered against jitter. The right lead depends on the PC and the refresh rate; it has only been
+  tuned on one machine.
 - Without factory calibration the shader falls back to a generic approximation that does not give
   a clean 3D image. It is not a usable fallback.
 - Chrome or Edge (WebGL2), page zoom 100 %. Windows only.

@@ -11,10 +11,10 @@ import { Matrix4, PerspectiveCamera, Quaternion, Vector3 } from 'three';
  *   1. The main Orbit Camera (`baseCamera`) defines the center of the virtual screen window
  *      at distance `convergenceDist` along its look direction (typically the center of the
  *      scene, plus an adjustable `convergenceOffsetM`).
- *   2. Real-time tracked eye positions `(leftEyeMm, rightEyeMm)` from `sr-bridge` are
- *      converted from physical screen-space millimeters (relative to the nominal viewing
- *      position `(0, +100 mm, +600 mm)`) into virtual camera-space meters, scaled by the
- *      world-to-screen ratio `worldPerPhysicalMeter = virtualScreenWidthM / displayWidthM`.
+ *   2. Each tracked eye (physical metres, relative to the screen's centre) is placed in the
+ *      virtual scene as that position times one factor, on all three axes: the factor that puts
+ *      the nominal head (60 cm, centred) on the orbit camera. One factor for all three axes and
+ *      both eyes is what keeps the scene fixed in space while the head moves.
  *   3. Each eye camera (`leftCamera`, `rightCamera`) is placed at its exact 3D offset in
  *      world space and given an asymmetric off-axis projection matrix (`makePerspective`)
  *      whose frustum edges pass strictly through the four corners of the virtual screen
@@ -28,18 +28,23 @@ import { Matrix4, PerspectiveCamera, Quaternion, Vector3 } from 'three';
  */
 
 export interface KooimaTuning {
-  /** Stereo baseline multiplier (0 = 2D mono, 1.0 = physical 1:1 IPD, up to 2.0). */
+  /** Eye separation, 1 = the true one (stereo and head motion then agree). 0 = no stereo. */
   stereoStrength: number;
   /** Shifts the zero-parallax convergence plane forward (-) or backward (+) in meters. */
   convergenceOffsetM: number;
-  /** Scales head-tracking motion parallax (0 = fixed sweet-spot, 1.0 = 1:1 physical head tracking). */
+  /** Head motion, 1 = the physical head (the scene stays fixed in space). 0 = a fixed viewpoint. */
   parallaxScale: number;
   /** Swaps Left and Right eye views if needed for phase calibration. */
   swapEyes: boolean;
 }
 
+/** Where the head is expected: 60 cm in front of the screen's centre (the eye tracker's frame). */
+const NOMINAL_EYE_DISTANCE_M = 0.6;
+const NOMINAL_EYE_HEIGHT_M = 0.0;
+
 export const DEFAULT_KOOIMA_TUNING: KooimaTuning = {
-  stereoStrength: 0.40, // Doux et naturel (évite le dédoublement / diplopie sur écran 27" 4K)
+  // 1 = the true eye separation, the only value at which stereo and head motion agree on the depth.
+  stereoStrength: 1.0,
   convergenceOffsetM: 0.0, // Plan de l'écran calé sur le centre de la scène
   parallaxScale: 1.0,
   swapEyes: false,
@@ -57,7 +62,6 @@ export class KooimaStereoRig {
   private readonly screenCenter = new Vector3();
   private readonly eyeWorld = new Vector3();
 
-  private readonly nominalEyeCenterM = new Vector3(0, 0.10, 0.60); // matches sr-bridge default eye (0, 100, 600) mm
 
   /**
    * Updates `leftCamera` and `rightCamera` world transforms and off-axis projection
@@ -101,44 +105,45 @@ export class KooimaStereoRig {
       .copy(this.camPos)
       .addScaledVector(this.backAxis, -convergenceDist);
 
-    // Convert tracked left & right eyes from physical mm to head center + stereo baseline in meters
-    const lxM = leftEyeMm[0] * 0.001;
-    const lyM = leftEyeMm[1] * 0.001;
-    const lzM = Math.max(0.25, leftEyeMm[2] * 0.001);
-
-    const rxM = rightEyeMm[0] * 0.001;
-    const ryM = rightEyeMm[1] * 0.001;
-    const rzM = Math.max(0.25, rightEyeMm[2] * 0.001);
-
-    // Cyclopean (mid-eye) position and inter-eye half-vector in physical meters
-    const midX = 0.5 * (lxM + rxM);
-    const midY = 0.5 * (lyM + ryM);
-    const midZ = 0.5 * (lzM + rzM);
-
-    // Inter-eye separation (IPD) scaled by stereoStrength
-    const nominalIpdM = 0.063;
-    const measuredIpdM = Math.hypot(rxM - lxM, ryM - lyM, rzM - lzM);
-    const effectiveIpdM = measuredIpdM > 0.03 && measuredIpdM < 0.12 ? measuredIpdM : nominalIpdM;
-    const ipdSign = tuning.swapEyes ? -1 : 1;
-
-    const halfIpdX = 0.5 * effectiveIpdM * tuning.stereoStrength * ipdSign;
-    const halfIpdY = 0.5 * (ryM - lyM) * tuning.stereoStrength * ipdSign;
-    const halfIpdZ = 0.5 * (rzM - lzM) * tuning.stereoStrength * ipdSign;
-
-    // Head displacement from nominal center (with soft damping on Z so camera stays in sweet convergence range)
-    const headShiftX = (midX - this.nominalEyeCenterM.x) * tuning.parallaxScale;
-    const headShiftY = (midY - this.nominalEyeCenterM.y) * tuning.parallaxScale;
-    const headShiftZ = (midZ - this.nominalEyeCenterM.z) * tuning.parallaxScale * 0.35;
-
-    // Keep camera near nominal convergence distance to preserve crisp, punchy stereo depth
-    const nominalCameraZM = convergenceDist;
-    const leftScreenX = (headShiftX - halfIpdX) * worldPerPhysM;
-    const leftScreenY = (headShiftY - halfIpdY) * worldPerPhysM;
-    const leftScreenZ = Math.max(0.20, nominalCameraZM + headShiftZ * worldPerPhysM - halfIpdZ);
-
-    const rightScreenX = (headShiftX + halfIpdX) * worldPerPhysM;
-    const rightScreenY = (headShiftY + halfIpdY) * worldPerPhysM;
-    const rightScreenZ = Math.max(0.20, nominalCameraZM + headShiftZ * worldPerPhysM + halfIpdZ);
+    // ── The eyes: one scale for everything ──────────────────────────────────────────────────
+    // For the scene to stay put behind the glass while the head moves, each virtual eye must be
+    // the physical eye (relative to the screen's centre) times ONE factor, on all three axes, both
+    // eyes alike. Then the rays of every head position through their screen points meet at the
+    // same place: the scene is seen fixed in space, and moving the head looks around it. Different
+    // scales per axis (or a reduced eye separation) make the scene turn with the head, and stereo
+    // and head motion disagree on the depth.
+    // The factor puts the nominal head position (60 cm, centred) exactly on the orbit camera, so
+    // the 3D view frames the scene as the 2D view does.
+    const k = convergenceDist / NOMINAL_EYE_DISTANCE_M;
+    const toVirtual = (eyeMm: readonly [number, number, number]): [number, number, number] => {
+      const x = eyeMm[0] * 0.001;
+      const y = eyeMm[1] * 0.001;
+      const z = Math.max(0.25, eyeMm[2] * 0.001);
+      // parallaxScale < 1 pulls the head towards the nominal point (less look-around, at the cost
+      // of the scene no longer being exactly fixed); 1 = the physical head.
+      const p = tuning.parallaxScale;
+      return [k * x * p, k * (NOMINAL_EYE_HEIGHT_M + (y - NOMINAL_EYE_HEIGHT_M) * p), k * (NOMINAL_EYE_DISTANCE_M + (z - NOMINAL_EYE_DISTANCE_M) * p)];
+    };
+    let left = toVirtual(leftEyeMm);
+    let right = toVirtual(rightEyeMm);
+    // A lost or implausible eye pair (IPD outside 3..12 cm): the mid-eye with a nominal IPD.
+    const ipdPhys = Math.hypot(rightEyeMm[0] - leftEyeMm[0], rightEyeMm[1] - leftEyeMm[1], rightEyeMm[2] - leftEyeMm[2]) * 0.001;
+    if (!(ipdPhys > 0.03 && ipdPhys < 0.12)) {
+      const mid: [number, number, number] = [(left[0] + right[0]) / 2, (left[1] + right[1]) / 2, (left[2] + right[2]) / 2];
+      const half = 0.5 * 0.063 * k;
+      left = [mid[0] - half, mid[1], mid[2]];
+      right = [mid[0] + half, mid[1], mid[2]];
+    }
+    // stereoStrength scales the separation about the mid-eye: 1 = the true one (the scene is then
+    // seen at a single, consistent depth); less flattens the stereo without flattening head motion.
+    const mx = (left[0] + right[0]) / 2, my = (left[1] + right[1]) / 2, mz = (left[2] + right[2]) / 2;
+    const sep = tuning.stereoStrength * (tuning.swapEyes ? -1 : 1);
+    const leftScreenX = mx + (left[0] - mx) * sep;
+    const leftScreenY = my + (left[1] - my) * sep;
+    const leftScreenZ = Math.max(0.2, mz + (left[2] - mz) * sep);
+    const rightScreenX = mx + (right[0] - mx) * sep;
+    const rightScreenY = my + (right[1] - my) * sep;
+    const rightScreenZ = Math.max(0.2, mz + (right[2] - mz) * sep);
 
     this.configureEyeCamera(
       this.leftCamera,

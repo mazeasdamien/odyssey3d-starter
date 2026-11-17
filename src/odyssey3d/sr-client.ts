@@ -62,6 +62,11 @@ export interface SrBridgeState {
   leftEyeMm: [number, number, number];
   rightEyeMm: [number, number, number];
   weaverPosMm: [number, number, number];
+  /**
+   * The mid-eye the bridge PREDICTS for `leadMs` ahead, the one the weave attributes were computed
+   * for. Equal to weaverPosMm with no prediction (old bridge, nobody tracked, lead 0).
+   */
+  weavePosMm: [number, number, number];
   display: OdysseyDisplayInfo;
   optics: OdysseyOpticsInfo;
   weaveCorners: OdysseyWeaveCorners;
@@ -103,6 +108,7 @@ export const ODYSSEY_G90XF_DEFAULTS: SrBridgeState = {
   leftEyeMm: [-31.5, 100.0, 600.0],
   rightEyeMm: [31.5, 100.0, 600.0],
   weaverPosMm: [0.0, 100.0, 600.0],
+  weavePosMm: [0.0, 100.0, 600.0],
   display: {
     model: 'Samsung Odyssey 3D (G90XF)',
     resW: 3840,
@@ -155,10 +161,15 @@ const finitePositive = (v: unknown): v is number =>
 
 /**
  * How far ahead the bridge predicts the head, in milliseconds: the time between the eye tracker's
- * measurement and the picture reaching the panel (transport, one rendered frame, scan-out).
- * 0 = no prediction. Too low and the depth lags behind a moving head; too high and it overshoots.
+ * measurement and the picture reaching the panel. 0 = no prediction. Too low and the views lag
+ * behind a moving head (the image doubles when moving fast); too high and they overshoot.
+ *
+ * The official LeiaSR weaver predicts one frame (16.7 ms, its `getLatency` on this machine) but
+ * draws straight to the screen. A browser page adds about two frames on top: the bridge's stream
+ * (up to 8 ms), the wait for the next animation frame (up to 16.7 ms) and the compositor (16.7 ms).
+ * Hence 50 (was 35, which doubled on fast head moves, 2026-11-17).
  */
-export const DEFAULT_PREDICTION_LEAD_MS = 35;
+export const DEFAULT_PREDICTION_LEAD_MS = 50;
 
 export interface SrBridgeClientOptions {
   baseUrl?: string;
@@ -325,16 +336,24 @@ export class SrBridgeClient {
       };
     }
 
-    // Frame-rate independent exponential smoothing (time constant ~20 ms). The weave phase
-    // depends on the eye position, so heavy smoothing shows up as the wrong view while moving.
+    // The views are rendered for the SAME predicted head as the weave (2026-11-17): the bridge
+    // computes the weave for where the head will be `leadMs` ahead; eyes left at their measured
+    // place gave views for an older head than the weave expects, and on a fast move each eye got
+    // part of the other's view (the image doubled). Both eyes are moved by the prediction's offset.
+    // Then a light, frame-rate independent smoothing (12 ms) against the stream's jitter.
+    const s = this.state;
+    const ahead = [0, 1, 2].map((i) => {
+      const d = s.weavePosMm[i]! - s.weaverPosMm[i]!;
+      return Number.isFinite(d) && Math.abs(d) < 150 ? d : 0; // a wild prediction is ignored
+    });
     const nowMs = performance.now();
     const dtMs = Math.min(100, Math.max(0, nowMs - this.lastSmoothMs));
     this.lastSmoothMs = nowMs;
-    const alpha = 1 - Math.exp(-dtMs / 20);
+    const alpha = 1 - Math.exp(-dtMs / 12);
     for (let i = 0; i < 3; i += 1) {
-      this.smoothedLeftMm[i] += (this.state.leftEyeMm[i] - this.smoothedLeftMm[i]) * alpha;
-      this.smoothedRightMm[i] += (this.state.rightEyeMm[i] - this.smoothedRightMm[i]) * alpha;
-      this.smoothedWeaverMm[i] += (this.state.weaverPosMm[i] - this.smoothedWeaverMm[i]) * alpha;
+      this.smoothedLeftMm[i] += (s.leftEyeMm[i]! + ahead[i]! - this.smoothedLeftMm[i]) * alpha;
+      this.smoothedRightMm[i] += (s.rightEyeMm[i]! + ahead[i]! - this.smoothedRightMm[i]) * alpha;
+      this.smoothedWeaverMm[i] += (s.weaverPosMm[i]! + ahead[i]! - this.smoothedWeaverMm[i]) * alpha;
     }
 
     return {
@@ -561,6 +580,11 @@ export class SrBridgeClient {
       leftEyeMm: isVec3(data.leftEyeMm) ? data.leftEyeMm : this.state.leftEyeMm,
       rightEyeMm: isVec3(data.rightEyeMm) ? data.rightEyeMm : this.state.rightEyeMm,
       weaverPosMm: isVec3(data.weaverPosMm) ? data.weaverPosMm : this.state.weaverPosMm,
+      weavePosMm: isVec3(data.weavePosMm)
+        ? data.weavePosMm
+        : isVec3(data.weaverPosMm)
+          ? data.weaverPosMm
+          : this.state.weavePosMm,
       display,
       optics,
       weaveCorners: corners,
