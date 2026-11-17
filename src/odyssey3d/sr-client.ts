@@ -371,7 +371,11 @@ export class SrBridgeClient {
         this.ipdEstMm += (len - this.ipdEstMm) * (learning ? 0.1 : 1 - Math.exp(-dtMs / 2000));
         this.ipdSamples += 1;
         this.ipdRejects = 0;
-        const aDir = 1 - Math.exp(-dtMs / 250);
+        // 20 ms, not more: the tracker's head-turn angle is precise (frame-to-frame noise ~0.1°,
+        // recorded); smoothing it over 250 ms made the views lag a head turn and the image
+        // doubled (user: « ça se dédouble quand on tourne la tête »). The glitches are the
+        // samples the IPD gate above already drops.
+        const aDir = 1 - Math.exp(-dtMs / 20);
         // No vertical component: the tracker puts one eye above the other by ±8 mm at random
         // (recorded: right−left height 0.7 ± 8.0 mm), which gave the two views a shaking
         // vertical offset (user: « quand je monte et descends la tête aussi ça tremble »). The
