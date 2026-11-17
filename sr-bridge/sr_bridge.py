@@ -167,6 +167,13 @@ class HeadPredictor:
     VELOCITY_CUTOFF_HZ = 5.0
     MAX_SPEED_MM_S = 1500.0
     MAX_AHEAD_S = 0.15
+    # Depth (z) is the tracker's noisiest axis: predicted, it spiked by up to 5 cm on a recorded
+    # fast move. Sideways and vertical motion are predicted; depth is only filtered.
+    AXIS_GAIN = (1.0, 1.0, 0.0)
+    # The tracker sometimes stalls for ~0.1 s on a fast move (recorded): extrapolating over the
+    # whole stall overshot by 3-4 cm, then snapped back. A sample is extended by at most this much
+    # of its age (a 60 Hz sample is normally under 17 ms old), then held.
+    MAX_SAMPLE_AGE_S = 0.025
 
     def __init__(self) -> None:
         self.t = None  # tracker clock of the last sample, s
@@ -191,8 +198,8 @@ class HeadPredictor:
             return None
         speed = math.sqrt(sum(c * c for c in self.v))
         k = 1.0 if speed <= self.MAX_SPEED_MM_S else self.MAX_SPEED_MM_S / speed
-        ahead = min(self.MAX_AHEAD_S, lead_s + max(0.0, now - self.arrival))
-        return [self.x[i] + self.v[i] * k * ahead for i in range(3)]
+        ahead = min(self.MAX_AHEAD_S, lead_s + min(self.MAX_SAMPLE_AGE_S, max(0.0, now - self.arrival)))
+        return [self.x[i] + self.v[i] * k * self.AXIS_GAIN[i] * ahead for i in range(3)]
 
 
 class Bridge:

@@ -206,6 +206,11 @@ export class SrBridgeClient {
   /** What THIS page last asked for. Another page may hold the lens too: never act on its wish. */
   private wantLens = false;
   private lastSmoothMs = performance.now();
+  /** Learnt eye separation (mm) and the smoothed left→right eye direction (unit vector). */
+  private ipdEstMm = 63;
+  private ipdSamples = 0;
+  private ipdRejects = 0;
+  private eyeDir: [number, number, number] = [1, 0, 0];
   private calibRetryAtMs = 0;
 
   /** Optional mouse-driven head simulation when testing parallax without webcam face tracking. */
@@ -349,11 +354,44 @@ export class SrBridgeClient {
     const nowMs = performance.now();
     const dtMs = Math.min(100, Math.max(0, nowMs - this.lastSmoothMs));
     this.lastSmoothMs = nowMs;
+
+    // The eye separation (2026-11-17, « la 3D tremble quand on bouge la tête »): recorded on the
+    // real tracker, the distance between the two eyes is steady at rest (62 ± 1 mm) but jumps to
+    // anywhere between 36 and 98 mm during a fast move, and the left/right depth difference
+    // wobbles by ±1 cm. Taken as measured, it made each eye's view jump by centimetres: the stereo
+    // shook. The eyes are now the (predicted, filtered) mid-eye ± half a slowly learnt IPD along a
+    // smoothed eye direction. A different person is picked up within a second or so.
+    const hx = s.rightEyeMm[0] - s.leftEyeMm[0];
+    const hy = s.rightEyeMm[1] - s.leftEyeMm[1];
+    const hz = s.rightEyeMm[2] - s.leftEyeMm[2];
+    const len = Math.hypot(hx, hy, hz);
+    if (s.tracking && len > 40 && len < 90) {
+      const learning = this.ipdSamples < 60;
+      if (learning || Math.abs(len - this.ipdEstMm) < 6) {
+        this.ipdEstMm += (len - this.ipdEstMm) * (learning ? 0.1 : 1 - Math.exp(-dtMs / 2000));
+        this.ipdSamples += 1;
+        this.ipdRejects = 0;
+        const aDir = 1 - Math.exp(-dtMs / 250);
+        // No vertical component: the tracker puts one eye above the other by ±8 mm at random
+        // (recorded: right−left height 0.7 ± 8.0 mm), which gave the two views a shaking
+        // vertical offset (user: « quand je monte et descends la tête aussi ça tremble »). The
+        // eyes are kept level; a tilted head then sees no vertical disparity, which is harmless.
+        this.eyeDir[0] += (hx / len - this.eyeDir[0]) * aDir;
+        this.eyeDir[1] = 0;
+        this.eyeDir[2] += (hz / len - this.eyeDir[2]) * aDir;
+        const n = Math.hypot(this.eyeDir[0], this.eyeDir[1], this.eyeDir[2]) || 1;
+        for (let i = 0; i < 3; i += 1) this.eyeDir[i] /= n;
+      } else if ((this.ipdRejects += 1) > 120) {
+        this.ipdSamples = 0; // consistently different for a while: someone else, learn again
+      }
+    }
+    const half = 0.5 * this.ipdEstMm;
     const alpha = 1 - Math.exp(-dtMs / 12);
     for (let i = 0; i < 3; i += 1) {
-      this.smoothedLeftMm[i] += (s.leftEyeMm[i]! + ahead[i]! - this.smoothedLeftMm[i]) * alpha;
-      this.smoothedRightMm[i] += (s.rightEyeMm[i]! + ahead[i]! - this.smoothedRightMm[i]) * alpha;
-      this.smoothedWeaverMm[i] += (s.weaverPosMm[i]! + ahead[i]! - this.smoothedWeaverMm[i]) * alpha;
+      const mid = s.weaverPosMm[i]! + ahead[i]!;
+      this.smoothedLeftMm[i] += (mid - this.eyeDir[i]! * half - this.smoothedLeftMm[i]) * alpha;
+      this.smoothedRightMm[i] += (mid + this.eyeDir[i]! * half - this.smoothedRightMm[i]) * alpha;
+      this.smoothedWeaverMm[i] += (mid - this.smoothedWeaverMm[i]) * alpha;
     }
 
     return {
